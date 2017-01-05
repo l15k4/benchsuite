@@ -4,6 +4,7 @@ import java.io.File
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
 
+import akka.Done
 import akka.actor.ActorSystem
 import akka.stream._
 import akka.stream.scaladsl.{FileIO, Framing}
@@ -13,8 +14,8 @@ import net.openhft.hashing.LongHashFunction
 import org.apache.spark.util.sketch.BloomFilter
 
 import scala.collection.mutable
-import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future}
+import scala.util.{Failure, Success}
 
 object HashSpike extends App {
 
@@ -29,7 +30,11 @@ object HashSpike extends App {
   implicit val system = ActorSystem("HashSpike")
   implicit val materializer = ActorMaterializer()
 
-  val totalSize = args match {
+  val rootDir = "/tmp/HashSpike"
+  val uuidFile = new File(s"$rootDir/uuid.csv")
+  uuidFile.createNewFile()
+
+  val sampleSize = args match {
     case Array(size) =>
       size.toInt
     case _ =>
@@ -37,25 +42,30 @@ object HashSpike extends App {
       throw new IllegalArgumentException("Specify number of uuids in a sample !!!")
   }
 
-  val rootDir = "/tmp/HashSpike"
+  val result =
+    for {
+      _ <- UuidGenerator.uuidF(sampleSize, 0.00001, uuidFile.toPath)
+      _ <- spike(s"$rootDir/murmur3_128", sampleSize) (line => Hashing.murmur3_128().hashString(line, StandardCharsets.UTF_8).asLong())
+      _ <- spike(s"$rootDir/openhft_64", sampleSize) (line => LongHashFunction.murmur_3().hashBytes(line.getBytes))
+      _ <- spike(s"$rootDir/farmHash_64", sampleSize) (line => Hashing.farmHashFingerprint64().hashString(line, StandardCharsets.UTF_8).asLong())
+      _ <- spike(s"$rootDir/sipHash_24", sampleSize) (line => Hashing.sipHash24().hashString(line, StandardCharsets.UTF_8).asLong())
+    } yield Done
 
-  for {
-   _ <- Future(spike(s"$rootDir/murmur3_128", totalSize) (line => Hashing.murmur3_128().hashString(line, StandardCharsets.UTF_8).asLong()))
-   _ <- Future(spike(s"$rootDir/openhft_64", totalSize) (line => LongHashFunction.murmur_3().hashBytes(line.getBytes)))
-   _ <- Future(spike(s"$rootDir/farmHash_64", totalSize) (line => Hashing.farmHashFingerprint64().hashString(line, StandardCharsets.UTF_8).asLong()))
-   _ <- Future(spike(s"$rootDir/sipHash_24", totalSize) (line => Hashing.sipHash24().hashString(line, StandardCharsets.UTF_8).asLong()))
-  } yield system.terminate()
+  result onComplete {
+    case Success(_) =>
+      system.terminate() andThen { case _ => System.exit(0) }
+    case Failure(ex) =>
+      println(ex)
+      system.terminate() andThen { case _ => System.exit(0) }
+  }
 
-  def spike(targetDir: String, sampleSize: Int)(hash: String => Long)(implicit m: Materializer) = {
+  def spike(targetDir: String, sampleSize: Int)(hash: String => Long)(implicit m: Materializer): Future[Int] = {
 
     new File(targetDir).mkdirs()
-
-    val uuidFile = new File(s"$targetDir/uuid.csv")
     val hashFile = new File(s"$targetDir/hash.csv")
-    uuidFile.createNewFile()
     hashFile.createNewFile()
 
-    def hashF =
+    def generateHashCodesToFile =
       FileIO.fromPath(uuidFile.toPath)
         .via(Framing.delimiter(ByteString("\n"), maximumFrameLength = 1024))
         .map(_.utf8String)
@@ -64,9 +74,9 @@ object HashSpike extends App {
         .buffer(2, OverflowStrategy.backpressure)
         .async
         .runWith(UuidGenerator.lineSink(hashFile.toPath))
-        .andThen { case _ => println(s"$hashFile: hash generation finished ...")}
+        .andThen { case _ => println(s"$hashFile: hash code generation finished ...")}
 
-    def softDuplicatesF =
+    def findApproxDuplicates =
       FileIO.fromPath(hashFile.toPath)
         .via(Framing.delimiter(ByteString("\n"), maximumFrameLength = 1024))
         .map(_.utf8String)
@@ -77,32 +87,33 @@ object HashSpike extends App {
             bf.putLong(line.toLong)
             acc -> bf
         }.map(_._1.toSet)
-        .andThen { case _ => println(s"$targetDir: soft duplicates check finished ...")}
+        .andThen { case _ => println(s"$targetDir: approx duplicates check finished ...")}
 
-    def hardDuplicatesF(softDuplicates: Set[Long]) =
+    def findDuplicates(approxDuplicates: Set[Long]) =
       FileIO.fromPath(hashFile.toPath)
         .via(Framing.delimiter(ByteString("\n"), maximumFrameLength = 1024))
         .map(_.utf8String)
         .runFold(new PrimitiveKeyOpenHashMap[Long, Int](16384)) {
-          case (acc, line) if softDuplicates.contains(line.toLong) =>
+          case (acc, line) if approxDuplicates.contains(line.toLong) =>
             acc.adjust(line.toLong)(_.map(_ + 1).getOrElse(1))
           case (acc, _) =>
             acc
-        }.andThen { case _ => println(s"$targetDir: hard duplicates check finished ...")}
+        }.andThen { case _ => println(s"$targetDir: duplicates check finished ...")}
 
     def resultF =
       for {
-        _ <- UuidGenerator.uuidF(sampleSize, 0.00001, uuidFile.toPath)
-        _ <- hashF
-        softDuplicates <- softDuplicatesF
-        hardDuplicates <- hardDuplicatesF(softDuplicates)
-      } yield hardDuplicates
+        _ <- generateHashCodesToFile
+        approxDuplicates <- findApproxDuplicates
+        duplicates <- findDuplicates(approxDuplicates)
+      } yield duplicates.count(_._2 > 1)
 
     val start = System.currentTimeMillis()
-    val result = Await.result(resultF, 24.hours)
-    val tookMS = System.currentTimeMillis() - start
-    val tookS = tookMS / 1000D
+    def ended = (System.currentTimeMillis() - start) / 1000D
 
-    println(s"$targetDir : ${result.count(_._2 > 1)} collisions found in $tookS seconds !!!")
+    resultF.andThen {
+      case Success(duplicatesCount) =>
+        println(s"$targetDir : $duplicatesCount collisions found in $ended seconds !!!")
+    }
+
   }
 }
