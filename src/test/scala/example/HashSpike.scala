@@ -2,20 +2,17 @@ package example
 
 import java.io.File
 import java.nio.charset.StandardCharsets
-import java.nio.file.Path
-import java.util.UUID
 import java.util.concurrent.Executors
 
 import akka.actor.ActorSystem
 import akka.stream._
-import akka.stream.scaladsl.{FileIO, Flow, Framing, Keep, Sink, Source}
-import akka.stream.stage.{GraphStage, GraphStageLogic, InHandler, OutHandler}
+import akka.stream.scaladsl.{FileIO, Framing}
 import akka.util.ByteString
 import com.google.common.hash.Hashing
 import net.openhft.hashing.LongHashFunction
 import org.apache.spark.util.sketch.BloomFilter
 
-import scala.collection.{immutable, mutable}
+import scala.collection.mutable
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 
@@ -28,7 +25,7 @@ object HashSpike extends App {
     }
   }
 
-  val ec = ExecutionContext.fromExecutorService(Executors.newFixedThreadPool(4))
+  implicit val ec = ExecutionContext.fromExecutorService(Executors.newFixedThreadPool(4))
   implicit val system = ActorSystem("HashSpike")
   implicit val materializer = ActorMaterializer()
 
@@ -43,10 +40,10 @@ object HashSpike extends App {
   val rootDir = "/tmp/HashSpike"
 
   for {
-   _ <- Future(spike(s"$rootDir/murmur3_128", totalSize) (line => Hashing.murmur3_128().hashString(line, StandardCharsets.UTF_8).asLong())) (ec)
-   _ <- Future(spike(s"$rootDir/openhft_64", totalSize) (line => LongHashFunction.murmur_3().hashBytes(line.getBytes))) (ec)
-   _ <- Future(spike(s"$rootDir/farmHash_64", totalSize) (line => Hashing.farmHashFingerprint64().hashString(line, StandardCharsets.UTF_8).asLong())) (ec)
-   _ <- Future(spike(s"$rootDir/sipHash_24", totalSize) (line => Hashing.sipHash24().hashString(line, StandardCharsets.UTF_8).asLong())) (ec)
+   _ <- Future(spike(s"$rootDir/murmur3_128", totalSize) (line => Hashing.murmur3_128().hashString(line, StandardCharsets.UTF_8).asLong()))
+   _ <- Future(spike(s"$rootDir/openhft_64", totalSize) (line => LongHashFunction.murmur_3().hashBytes(line.getBytes)))
+   _ <- Future(spike(s"$rootDir/farmHash_64", totalSize) (line => Hashing.farmHashFingerprint64().hashString(line, StandardCharsets.UTF_8).asLong()))
+   _ <- Future(spike(s"$rootDir/sipHash_24", totalSize) (line => Hashing.sipHash24().hashString(line, StandardCharsets.UTF_8).asLong()))
   } yield system.terminate()
 
   def spike(targetDir: String, sampleSize: Int)(hash: String => Long)(implicit m: Materializer) = {
@@ -55,34 +52,8 @@ object HashSpike extends App {
 
     val uuidFile = new File(s"$targetDir/uuid.csv")
     val hashFile = new File(s"$targetDir/hash.csv")
-    val duplicatesFile = new File(s"$targetDir/duplicates.csv")
     uuidFile.createNewFile()
     hashFile.createNewFile()
-    duplicatesFile.createNewFile()
-
-    def lineSink(file: Path): Sink[immutable.Seq[String], Future[IOResult]] =
-    Flow[immutable.Seq[String]]
-      .map(records => ByteString(records.mkString("", "\n", "\n")))
-      .toMat(FileIO.toPath(file))(Keep.right)
-
-    val bfStage =
-      new BFilter[String](BloomFilter.create(sampleSize, 0.00001), {
-        (bf, uuid) =>
-          val contains = bf.mightContainString(uuid)
-          if (!contains) bf.putString(uuid)
-          !contains
-      }
-      )
-
-    def uuidF =
-      Source.fromIterator(() => Iterator.range(0, sampleSize))
-        .map(_ => UUID.randomUUID().toString)
-        .via(bfStage)
-        .grouped(500)
-        .buffer(2, OverflowStrategy.backpressure)
-        .async
-        .runWith(lineSink(uuidFile.toPath))
-        .andThen { case _ => println(s"$targetDir: UUID generation finished ...")}
 
     def hashF =
       FileIO.fromPath(uuidFile.toPath)
@@ -92,8 +63,8 @@ object HashSpike extends App {
         .grouped(500)
         .buffer(2, OverflowStrategy.backpressure)
         .async
-        .runWith(lineSink(hashFile.toPath))
-        .andThen { case _ => println(s"$targetDir: hash generation finished ...")}
+        .runWith(UuidGenerator.lineSink(hashFile.toPath))
+        .andThen { case _ => println(s"$hashFile: hash generation finished ...")}
 
     def softDuplicatesF =
       FileIO.fromPath(hashFile.toPath)
@@ -121,7 +92,7 @@ object HashSpike extends App {
 
     def resultF =
       for {
-        _ <- uuidF
+        _ <- UuidGenerator.uuidF(sampleSize, 0.00001, uuidFile.toPath)
         _ <- hashF
         softDuplicates <- softDuplicatesF
         hardDuplicates <- hardDuplicatesF(softDuplicates)
@@ -134,25 +105,4 @@ object HashSpike extends App {
 
     println(s"$targetDir : ${result.count(_._2 > 1)} collisions found in $tookS seconds !!!")
   }
-}
-
-class BFilter[A](bf: BloomFilter, p: (BloomFilter, A) => Boolean) extends GraphStage[FlowShape[A, A]] {
-  val in = Inlet[A]("Filter.in")
-  val out = Outlet[A]("Filter.out")
-  val shape = FlowShape.of(in, out)
-  override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
-    new GraphStageLogic(shape) {
-      setHandler(in, new InHandler {
-        override def onPush(): Unit = {
-          val elem = grab(in)
-          if (p(bf, elem)) push(out, elem)
-          else pull(in)
-        }
-      })
-      setHandler(out, new OutHandler {
-        override def onPull(): Unit = {
-          pull(in)
-        }
-      })
-    }
 }
