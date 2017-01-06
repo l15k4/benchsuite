@@ -14,7 +14,7 @@ import scala.concurrent.{ExecutionContext, Future}
 
 object UuidGenerator {
 
-  def lineSink(file: Path): Sink[immutable.Seq[String], Future[IOResult]] =
+  def fileLineSink(file: Path): Sink[immutable.Seq[String], Future[IOResult]] =
     Flow[immutable.Seq[String]]
       .map(records => ByteString(records.mkString("", "\n", "\n")))
       .toMat(FileIO.toPath(file))(Keep.right)
@@ -28,14 +28,14 @@ object UuidGenerator {
     }
     )
 
-  def uuidF(sampleSize: Int, fpp: Double, uuidFilePath: Path)(implicit m: Materializer) =
+  def writeUuids(sampleSize: Int, fpp: Double, uuidFilePath: Path)(implicit m: Materializer): Future[IOResult] =
     Source.fromIterator(() => Iterator.range(0, sampleSize))
       .map(_ => UUID.randomUUID().toString)
       .via(bfStage(sampleSize, fpp))
       .grouped(500)
       .buffer(2, OverflowStrategy.backpressure)
       .async
-      .runWith(lineSink(uuidFilePath))
+      .runWith(fileLineSink(uuidFilePath))
       .andThen { case _ => println(s"$uuidFilePath: UUID generation finished ...")}(ExecutionContext.Implicits.global)
 
   class BFilter[A](bf: BloomFilter, p: (BloomFilter, A) => Boolean) extends GraphStage[FlowShape[A, A]] {

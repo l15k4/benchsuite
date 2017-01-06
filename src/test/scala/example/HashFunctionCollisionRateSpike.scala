@@ -17,14 +17,7 @@ import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success}
 
-object HashSpike extends App {
-
-  implicit class ImpressionsCountPimp(underlying: PrimitiveKeyOpenHashMap[Long, Int]) {
-    def adjust(k: Long)(f: Option[Int] => Int): PrimitiveKeyOpenHashMap[Long, Int] = {
-      underlying.update(k, f(Option(underlying.getOrElse(k, null.asInstanceOf[Int]))))
-      underlying
-    }
-  }
+object HashFunctionCollisionRateSpike extends App {
 
   implicit val ec = ExecutionContext.fromExecutorService(Executors.newFixedThreadPool(4))
   implicit val system = ActorSystem("HashSpike")
@@ -42,24 +35,7 @@ object HashSpike extends App {
       throw new IllegalArgumentException("Specify number of uuids in a sample !!!")
   }
 
-  val result =
-    for {
-      _ <- UuidGenerator.uuidF(sampleSize, 0.00001, uuidFile.toPath)
-      _ <- spike(s"$rootDir/murmur3_128", sampleSize) (line => Hashing.murmur3_128().hashString(line, StandardCharsets.UTF_8).asLong())
-      _ <- spike(s"$rootDir/openhft_64", sampleSize) (line => LongHashFunction.murmur_3().hashBytes(line.getBytes))
-      _ <- spike(s"$rootDir/farmHash_64", sampleSize) (line => Hashing.farmHashFingerprint64().hashString(line, StandardCharsets.UTF_8).asLong())
-      _ <- spike(s"$rootDir/sipHash_24", sampleSize) (line => Hashing.sipHash24().hashString(line, StandardCharsets.UTF_8).asLong())
-    } yield Done
-
-  result onComplete {
-    case Success(_) =>
-      system.terminate() andThen { case _ => System.exit(0) }
-    case Failure(ex) =>
-      println(ex)
-      system.terminate() andThen { case _ => System.exit(0) }
-  }
-
-  def spike(targetDir: String, sampleSize: Int)(hash: String => Long)(implicit m: Materializer): Future[Int] = {
+  def spike(targetDir: String)(hash: String => Long): Future[Int] = {
 
     new File(targetDir).mkdirs()
     val hashFile = new File(s"$targetDir/hash.csv")
@@ -73,7 +49,7 @@ object HashSpike extends App {
         .grouped(500)
         .buffer(2, OverflowStrategy.backpressure)
         .async
-        .runWith(UuidGenerator.lineSink(hashFile.toPath))
+        .runWith(UuidGenerator.fileLineSink(hashFile.toPath))
         .andThen { case _ => println(s"$hashFile: hash code generation finished ...")}
 
     def findApproxDuplicates =
@@ -95,7 +71,8 @@ object HashSpike extends App {
         .map(_.utf8String)
         .runFold(new PrimitiveKeyOpenHashMap[Long, Int](16384)) {
           case (acc, line) if approxDuplicates.contains(line.toLong) =>
-            acc.adjust(line.toLong)(_.map(_ + 1).getOrElse(1))
+            acc.changeValue(line.toLong, 1, _ + 1)
+            acc
           case (acc, _) =>
             acc
         }.andThen { case _ => println(s"$targetDir: duplicates check finished ...")}
@@ -108,12 +85,29 @@ object HashSpike extends App {
       } yield duplicates.count(_._2 > 1)
 
     val start = System.currentTimeMillis()
-    def ended = (System.currentTimeMillis() - start) / 1000D
 
     resultF.andThen {
       case Success(duplicatesCount) =>
-        println(s"$targetDir : $duplicatesCount collisions found in $ended seconds !!!")
+        def took = (System.currentTimeMillis() - start) / 1000D
+        println(s"$targetDir : $duplicatesCount collisions found in $took seconds !!!")
     }
 
+  }
+
+  val futureResult =
+    for {
+      _ <- UuidGenerator.writeUuids(sampleSize, 0.00001, uuidFile.toPath)
+      _ <- spike(s"$rootDir/murmur3_128") (line => Hashing.murmur3_128().hashString(line, StandardCharsets.UTF_8).asLong())
+      _ <- spike(s"$rootDir/openhft_64") (line => LongHashFunction.murmur_3().hashBytes(line.getBytes))
+      _ <- spike(s"$rootDir/farmHash_64") (line => Hashing.farmHashFingerprint64().hashString(line, StandardCharsets.UTF_8).asLong())
+      _ <- spike(s"$rootDir/sipHash_24") (line => Hashing.sipHash24().hashString(line, StandardCharsets.UTF_8).asLong())
+    } yield Done
+
+  futureResult onComplete {
+    case Success(_) =>
+      system.terminate() andThen { case _ => System.exit(0) }
+    case Failure(ex) =>
+      println(ex)
+      system.terminate() andThen { case _ => System.exit(0) }
   }
 }

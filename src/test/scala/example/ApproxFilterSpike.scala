@@ -19,14 +19,13 @@ import org.apache.spark.util.sketch
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success}
 
-
 object ApproxFilterSpike extends App {
 
   implicit val ec = ExecutionContext.fromExecutorService(Executors.newFixedThreadPool(4))
   implicit val system = ActorSystem("ApproxFilterSpike")
   implicit val materializer = ActorMaterializer()
 
-  val (sampleSize, fpp) = args match {
+  val (sampleSize, fpp) = args match { // note that fpp = 0.00001 offers the lowest collision rate and size for UUIDs
     case Array(size, falsePositiveRate) =>
       size.toInt -> falsePositiveRate.toDouble
     case _ =>
@@ -39,7 +38,7 @@ object ApproxFilterSpike extends App {
   val uuidFile = new File(s"$targetDir/uuid.csv")
   uuidFile.createNewFile()
 
-  val sparkBF: Sink[String, Future[(Int, sketch.BloomFilter)]] =
+  val sparkBloomFilterSink: Sink[String, Future[(Int, sketch.BloomFilter)]] =
     Sink.fold(0 -> sketch.BloomFilter.create(sampleSize, fpp)) {
       case ((count, bf), uuid) if bf.mightContainString(uuid) =>
         bf.putString(uuid)
@@ -49,7 +48,7 @@ object ApproxFilterSpike extends App {
         count -> bf
     }
 
-  val guavaBF: Sink[String, Future[(Int, hash.BloomFilter[CharSequence])]] =
+  val guavaBloomFilterSink: Sink[String, Future[(Int, hash.BloomFilter[CharSequence])]] =
     Sink.fold(0 -> hash.BloomFilter.create[CharSequence](Funnels.stringFunnel(StandardCharsets.UTF_8), sampleSize, fpp)) {
       case ((count, bf), uuid) if bf.mightContain(uuid) =>
         bf.put(uuid)
@@ -59,10 +58,11 @@ object ApproxFilterSpike extends App {
         count -> bf
     }
 
-  def cuckooBF(algorithm: Algorithm): Sink[String, Future[(Int, CuckooFilter[String])]] = {
+  def cuckooFilterSink(algorithm: Algorithm): Sink[String, Future[(Int, CuckooFilter[String])]] = {
     val cuckooF = new CuckooFilter.Builder[String](Funnels.stringFunnel(StandardCharsets.UTF_8), sampleSize)
         .withFalsePositiveRate(fpp)
         .withHashAlgorithm(algorithm)
+        .withExpectedConcurrency(4)
         .build()
     Sink.fold(0 -> cuckooF) {
       case ((count, bf), uuid) if bf.mightContain(uuid) =>
@@ -74,36 +74,18 @@ object ApproxFilterSpike extends App {
     }
   }
 
-  def writeFile(name: String, fn: ByteArrayOutputStream => Unit): Long = {
+  def writeFilterToFile(name: String, fn: ByteArrayOutputStream => Unit): Long = {
     val out = new ByteArrayOutputStream()
     try fn(out) finally out.close()
     val bfBytes = out.toByteArray
     Files.write(Paths.get(targetDir, name), bfBytes).toFile.length()
   }
 
-  def writeSparkBF(bf: sketch.BloomFilter) = writeFile("sparkBF.bf", out => bf.writeTo(out))
-  def writeGuavaBF(bf: hash.BloomFilter[CharSequence]) = writeFile("guavaBF.bf", out => bf.writeTo(out))
+  def getSparkFilterSize(bf: sketch.BloomFilter) = writeFilterToFile("sparkBF.bf", out => bf.writeTo(out))
+  def getGuavaFilterSize(bf: hash.BloomFilter[CharSequence]) = writeFilterToFile("guavaBF.bf", out => bf.writeTo(out))
+  def getCuckooFilterSize(bf: CuckooFilter[String]) = bf.getStorageSize / 8
 
-  val result =
-    for {
-      _ <- UuidGenerator.uuidF(sampleSize, 0.00001, uuidFile.toPath)
-      _ <- spike[sketch.BloomFilter]("sparkBF", sampleSize, uuidFile, sparkBF)(writeSparkBF)
-      _ <- spike[hash.BloomFilter[CharSequence]]("guavaBF", sampleSize, uuidFile, guavaBF)(writeGuavaBF)
-      _ <- spike[CuckooFilter[String]]("sipHash24 cuckooBF", sampleSize, uuidFile, cuckooBF(Algorithm.sipHash24))(_ => 0)
-      _ <- spike[CuckooFilter[String]]("Murmur3_128 cuckooBF", sampleSize, uuidFile, cuckooBF(Algorithm.Murmur3_128))(_ => 0)
-      _ <- spike[CuckooFilter[String]]("sha256 cuckooBF", sampleSize, uuidFile, cuckooBF(Algorithm.sha256))(_ => 0)
-    } yield Done
-
-  result onComplete {
-    case Success(_) =>
-      system.terminate() andThen { case _ => System.exit(0) }
-    case Failure(ex) =>
-      println(ex)
-      system.terminate() andThen { case _ => System.exit(0) }
-  }
-
-  def spike[S](name: String, sampleSize: Int, uuidFile: File, bfSink: Sink[String, Future[(Int, S)]])(persist: S => Long)(implicit m: Materializer): Future[(Int, S)] = {
-
+  def spike[S](name: String, bfSink: Sink[String, Future[(Int, S)]])(getSize: S => Long): Future[(Int, S)] = {
     def collisionCountF: Future[(Int, S)] =
       FileIO.fromPath(uuidFile.toPath)
         .via(Framing.delimiter(ByteString("\n"), maximumFrameLength = 1024))
@@ -111,13 +93,30 @@ object ApproxFilterSpike extends App {
         .runWith(bfSink)
 
     val start = System.currentTimeMillis()
-    def ended = (System.currentTimeMillis() - start) / 1000D
 
     collisionCountF.andThen {
       case Success((count, filter)) =>
-        val size = persist(filter)
-        println(s"$name finished in $ended seconds with $count collisions and size $size bytes ...")
+        def took = (System.currentTimeMillis() - start) / 1000D
+        println(s"$name finished in $took seconds with $count collisions and size ${getSize(filter)} bytes ...")
     }
-
   }
+
+  val futureResult =
+    for {
+      _ <- UuidGenerator.writeUuids(sampleSize, 0.00001, uuidFile.toPath)
+      _ <- spike[sketch.BloomFilter]("sparkBF", sparkBloomFilterSink)(getSparkFilterSize)
+      _ <- spike[hash.BloomFilter[CharSequence]]("guavaBF", guavaBloomFilterSink)(getGuavaFilterSize)
+      _ <- spike[CuckooFilter[String]]("cuckooF sipHash24", cuckooFilterSink(Algorithm.sipHash24))(getCuckooFilterSize)
+      _ <- spike[CuckooFilter[String]]("cuckooF Murmur3_128", cuckooFilterSink(Algorithm.Murmur3_128))(getCuckooFilterSize)
+      _ <- spike[CuckooFilter[String]]("cuckooF sha256", cuckooFilterSink(Algorithm.sha256))(getCuckooFilterSize)
+    } yield Done
+
+  futureResult onComplete {
+    case Success(_) =>
+      system.terminate() andThen { case _ => System.exit(0) }
+    case Failure(ex) =>
+      println(ex)
+      system.terminate() andThen { case _ => System.exit(0) }
+  }
+
 }
