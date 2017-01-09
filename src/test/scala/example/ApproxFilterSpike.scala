@@ -25,9 +25,9 @@ object ApproxFilterSpike extends App {
   implicit val system = ActorSystem("ApproxFilterSpike")
   implicit val materializer = ActorMaterializer()
 
-  val (sampleSize, fpp) = args match { // note that fpp = 0.00001 offers the lowest collision rate and size for UUIDs
-    case Array(size, falsePositiveRate) =>
-      size.toInt -> falsePositiveRate.toDouble
+  val (sampleSize, fpp, generateUuid) = args match { // note that fpp = 0.00001 offers the lowest collision rate and size for UUIDs
+    case Array(size, falsePositiveRate, generateUuidFile) =>
+      (size.toInt, falsePositiveRate.toDouble, generateUuidFile.toBoolean)
     case _ =>
       system.terminate()
       throw new IllegalArgumentException("Specify number of uuids in a sample !!!")
@@ -62,7 +62,6 @@ object ApproxFilterSpike extends App {
     val cuckooF = new CuckooFilter.Builder[String](Funnels.stringFunnel(StandardCharsets.UTF_8), sampleSize)
         .withFalsePositiveRate(fpp)
         .withHashAlgorithm(algorithm)
-        .withExpectedConcurrency(4)
         .build()
     Sink.fold(0 -> cuckooF) {
       case ((count, bf), uuid) if bf.mightContain(uuid) =>
@@ -103,7 +102,7 @@ object ApproxFilterSpike extends App {
 
   val futureResult =
     for {
-      _ <- UuidGenerator.writeUuids(sampleSize, 0.00001, uuidFile.toPath)
+      _ <- if (generateUuid) UuidGenerator.writeUuids(sampleSize, 0.00001, uuidFile.toPath) else Future.successful(Done)
       _ <- spike[sketch.BloomFilter]("sparkBF", sparkBloomFilterSink)(getSparkFilterSize)
       _ <- spike[hash.BloomFilter[CharSequence]]("guavaBF", guavaBloomFilterSink)(getGuavaFilterSize)
       _ <- spike[CuckooFilter[String]]("cuckooF sipHash24", cuckooFilterSink(Algorithm.sipHash24))(getCuckooFilterSize)

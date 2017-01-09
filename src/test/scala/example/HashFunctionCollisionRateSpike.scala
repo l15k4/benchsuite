@@ -25,11 +25,12 @@ object HashFunctionCollisionRateSpike extends App {
 
   val rootDir = "/tmp/HashSpike"
   val uuidFile = new File(s"$rootDir/uuid.csv")
+  uuidFile.getParentFile.mkdirs()
   uuidFile.createNewFile()
 
-  val sampleSize = args match {
-    case Array(size) =>
-      size.toInt
+  val (sampleSize, generateUuid) = args match {
+    case Array(size, generateUuidFile) =>
+      size.toInt -> generateUuidFile.toBoolean
     case _ =>
       system.terminate()
       throw new IllegalArgumentException("Specify number of uuids in a sample !!!")
@@ -96,7 +97,7 @@ object HashFunctionCollisionRateSpike extends App {
 
   val futureResult =
     for {
-      _ <- UuidGenerator.writeUuids(sampleSize, 0.00001, uuidFile.toPath)
+      _ <- if (generateUuid) UuidGenerator.writeUuids(sampleSize, 0.00001, uuidFile.toPath) else Future.successful(Done)
       _ <- spike(s"$rootDir/murmur3_128") (line => Hashing.murmur3_128().hashString(line, StandardCharsets.UTF_8).asLong())
       _ <- spike(s"$rootDir/openhft_64") (line => LongHashFunction.murmur_3().hashBytes(line.getBytes))
       _ <- spike(s"$rootDir/farmHash_64") (line => Hashing.farmHashFingerprint64().hashString(line, StandardCharsets.UTF_8).asLong())

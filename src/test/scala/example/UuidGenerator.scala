@@ -2,6 +2,7 @@ package example
 
 import java.nio.file.Path
 import java.util.UUID
+import java.util.concurrent.Executors
 
 import akka.stream.{Attributes, _}
 import akka.stream.scaladsl.{FileIO, Flow, Keep, Sink, Source}
@@ -28,15 +29,19 @@ object UuidGenerator {
     }
     )
 
-  def writeUuids(sampleSize: Int, fpp: Double, uuidFilePath: Path)(implicit m: Materializer): Future[IOResult] =
+  def writeUuids(sampleSize: Int, fpp: Double, uuidFilePath: Path)(implicit m: Materializer): Future[IOResult] = {
+    implicit val ec = ExecutionContext.fromExecutorService(Executors.newFixedThreadPool(3))
     Source.fromIterator(() => Iterator.range(0, sampleSize))
-      .map(_ => UUID.randomUUID().toString)
+      .grouped(10000)
+      .mapAsyncUnordered(3)( g => Future(g.map(_ => UUID.randomUUID().toString).toIndexedSeq) )
+      .mapConcat(identity)
       .via(bfStage(sampleSize, fpp))
       .grouped(500)
       .buffer(2, OverflowStrategy.backpressure)
       .async
       .runWith(fileLineSink(uuidFilePath))
       .andThen { case _ => println(s"$uuidFilePath: UUID generation finished ...")}(ExecutionContext.Implicits.global)
+  }
 
   class BFilter[A](bf: BloomFilter, p: (BloomFilter, A) => Boolean) extends GraphStage[FlowShape[A, A]] {
     val in = Inlet[A]("Filter.in")
