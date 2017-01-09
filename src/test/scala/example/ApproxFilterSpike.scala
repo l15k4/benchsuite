@@ -1,6 +1,6 @@
 package example
 
-import java.io.{ByteArrayOutputStream, File}
+import java.io.{ByteArrayOutputStream, File, FileOutputStream, ObjectOutputStream}
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
 import java.util.concurrent.Executors
@@ -73,16 +73,23 @@ object ApproxFilterSpike extends App {
     }
   }
 
-  def writeFilterToFile(name: String, fn: ByteArrayOutputStream => Unit): Long = {
+  def writeBloomFilterToFile(name: String, fn: ByteArrayOutputStream => Unit): Long = {
     val out = new ByteArrayOutputStream()
     try fn(out) finally out.close()
     val bfBytes = out.toByteArray
     Files.write(Paths.get(targetDir, name), bfBytes).toFile.length()
   }
 
-  def getSparkFilterSize(bf: sketch.BloomFilter) = writeFilterToFile("sparkBF.bf", out => bf.writeTo(out))
-  def getGuavaFilterSize(bf: hash.BloomFilter[CharSequence]) = writeFilterToFile("guavaBF.bf", out => bf.writeTo(out))
-  def getCuckooFilterSize(bf: CuckooFilter[String]) = bf.getStorageSize / 8
+  def writeCuckooFilterToFile(name: String, instance: AnyRef): Long = {
+    val targetFile = Paths.get(targetDir, name).toFile
+    val out = new ObjectOutputStream(new FileOutputStream(targetFile))
+    try out.writeObject(instance) finally out.close()
+    targetFile.length()
+  }
+
+  def getSparkFilterSize(bf: sketch.BloomFilter) = writeBloomFilterToFile("sparkBF.bf", out => bf.writeTo(out))
+  def getGuavaFilterSize(bf: hash.BloomFilter[CharSequence]) = writeBloomFilterToFile("guavaBF.bf", out => bf.writeTo(out))
+  def getCuckooFilterSize(bf: CuckooFilter[String]) = writeCuckooFilterToFile("cuckooF.bf", bf)
 
   def spike[S](name: String, bfSink: Sink[String, Future[(Int, S)]])(getSize: S => Long): Future[(Int, S)] = {
     def collisionCountF: Future[(Int, S)] =
