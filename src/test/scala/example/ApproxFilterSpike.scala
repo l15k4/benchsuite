@@ -73,23 +73,49 @@ object ApproxFilterSpike extends App {
     }
   }
 
+  def combinedFilterSink: Sink[String, Future[(Int, (hash.BloomFilter[CharSequence], CuckooFilter[String]))]] = {
+    val cuckooF = new CuckooFilter.Builder[String](Funnels.stringFunnel(StandardCharsets.UTF_8), sampleSize)
+      .withFalsePositiveRate(fpp)
+      .withHashAlgorithm(Algorithm.sipHash24)
+      .build()
+    val bloomF = hash.BloomFilter.create[CharSequence](Funnels.stringFunnel(StandardCharsets.UTF_8), sampleSize, fpp)
+    Sink.fold(0 -> (bloomF, cuckooF)) {
+      case ((count, (bf, cf)), uuid) if bf.mightContain(uuid) && cf.mightContain(uuid) =>
+        bf.put(uuid)
+        cf.put(uuid)
+        count+1 -> (bf, cf)
+      case ((count, (bf, cf)), uuid) =>
+        bf.put(uuid)
+        cf.put(uuid)
+        count -> (bf, cf)
+    }
+  }
+
   def writeBloomFilterToFile(name: String, fn: ByteArrayOutputStream => Unit): Long = {
+    val targetFilePath = Paths.get(targetDir, name)
+    targetFilePath.toFile.delete()
     val out = new ByteArrayOutputStream()
     try fn(out) finally out.close()
     val bfBytes = out.toByteArray
-    Files.write(Paths.get(targetDir, name), bfBytes).toFile.length()
+    Files.write(targetFilePath, bfBytes).toFile.length()
   }
 
   def writeCuckooFilterToFile(name: String, instance: AnyRef): Long = {
     val targetFile = Paths.get(targetDir, name).toFile
+    targetFile.delete()
     val out = new ObjectOutputStream(new FileOutputStream(targetFile))
     try out.writeObject(instance) finally out.close()
     targetFile.length()
   }
 
-  def getSparkFilterSize(bf: sketch.BloomFilter) = writeBloomFilterToFile("sparkBF.bf", out => bf.writeTo(out))
-  def getGuavaFilterSize(bf: hash.BloomFilter[CharSequence]) = writeBloomFilterToFile("guavaBF.bf", out => bf.writeTo(out))
-  def getCuckooFilterSize(bf: CuckooFilter[String]) = writeCuckooFilterToFile("cuckooF.bf", bf)
+  def getSparkFilterSize(bf: sketch.BloomFilter) =
+    writeBloomFilterToFile("sparkBF.bf", out => bf.writeTo(out))
+  def getGuavaFilterSize(bf: hash.BloomFilter[CharSequence]) =
+    writeBloomFilterToFile("guavaBF.bf", out => bf.writeTo(out))
+  def getCuckooFilterSize(bf: CuckooFilter[String]) =
+    writeCuckooFilterToFile("cuckooF.bf", bf)
+  def getCombinedFilterSize(bfs: (hash.BloomFilter[CharSequence], CuckooFilter[String])) =
+    writeBloomFilterToFile("guavaBF.bf", out => bfs._1.writeTo(out)) + writeCuckooFilterToFile("cuckooF.bf", bfs._2)
 
   def spike[S](name: String, bfSink: Sink[String, Future[(Int, S)]])(getSize: S => Long): Future[(Int, S)] = {
     def collisionCountF: Future[(Int, S)] =
@@ -110,10 +136,11 @@ object ApproxFilterSpike extends App {
   val futureResult =
     for {
       _ <- if (generateUuid) UuidGenerator.writeUuids(sampleSize, 0.00001, uuidFile.toPath) else Future.successful(Done)
-      _ <- spike[sketch.BloomFilter]("sparkBF", sparkBloomFilterSink)(getSparkFilterSize)
-      _ <- spike[hash.BloomFilter[CharSequence]]("guavaBF", guavaBloomFilterSink)(getGuavaFilterSize)
-      _ <- spike[CuckooFilter[String]]("cuckooF sipHash24", cuckooFilterSink(Algorithm.sipHash24))(getCuckooFilterSize)
+      _ <- spike[(hash.BloomFilter[CharSequence], CuckooFilter[String])]("combinedF", combinedFilterSink)(getCombinedFilterSize)
+      _ <- spike[hash.BloomFilter[CharSequence]]("guavaBF Murmur3_128", guavaBloomFilterSink)(getGuavaFilterSize)
       _ <- spike[CuckooFilter[String]]("cuckooF Murmur3_128", cuckooFilterSink(Algorithm.Murmur3_128))(getCuckooFilterSize)
+      _ <- spike[sketch.BloomFilter]("sparkBF Murmur3_32", sparkBloomFilterSink)(getSparkFilterSize)
+      _ <- spike[CuckooFilter[String]]("cuckooF sipHash24", cuckooFilterSink(Algorithm.sipHash24))(getCuckooFilterSize)
       _ <- spike[CuckooFilter[String]]("cuckooF sha256", cuckooFilterSink(Algorithm.sha256))(getCuckooFilterSize)
     } yield Done
 
