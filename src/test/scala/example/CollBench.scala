@@ -10,10 +10,10 @@ import org.scalameter.api._
 
 object CollBenchGroup extends Bench.Group {
   performance of "memory footprint" config(reports.resultDir -> "target/benchmarks/coll/memory") in {
-    include(new HashMemoryBench {})
+    include(new CollMemoryBench {})
   }
   performance of "running time" config(reports.resultDir -> "target/benchmarks/coll/time") in {
-    include(new HashPerfBench {})
+    include(new CollPerfBench {})
   }
 }
 

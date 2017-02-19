@@ -6,6 +6,7 @@ scalaVersion := "2.11.7"
 
 libraryDependencies ++= Seq(
   "com.rklaehn"             %% "abc"                    % "0.3.0",
+  "com.twitter"             %% "algebird-core"          % "0.12.4",
   "com.google.guava"        % "guava"                   % "20.0",
   "net.openhft"             % "zero-allocation-hashing" % "0.6",
   "org.apache.spark"        %% "spark-sketch"           % "2.0.2",
